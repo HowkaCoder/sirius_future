@@ -1,11 +1,8 @@
 package service
 
 import (
-	"log"
-
+	"log/slog"
 	"os"
-
-	"golang.org/x/exp/slog"
 )
 
 type LoggerService interface {
@@ -23,13 +20,7 @@ func NewLoggerService(log *slog.Logger) *loggerService {
 }
 
 func InitLogger() *slog.Logger {
-
-	logFile, err := os.OpenFile("log/sirius_future.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0666)
-	if err != nil {
-		log.Fatalf("Error opening log file: %v", err)
-	}
-	Logger := slog.New(slog.NewJSONHandler(logFile, nil))
-	return Logger
+	return slog.New(slog.NewJSONHandler(os.Stdout, nil))
 }
 
 func (lg *loggerService) Info(msg string, args ...any) {
