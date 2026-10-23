@@ -1,36 +1,14 @@
-# Dockerfile
-
-# Шаг 1: Устанавливаем Go для сборки
-FROM golang:1.23-alpine AS builder
-
-WORKDIR /app
-
-# Копируем go.mod и go.sum
+FROM golang:1.23-alpine AS build
+RUN apk add --no-cache gcc musl-dev
+WORKDIR /src
 COPY go.mod go.sum ./
-
-# Загружаем зависимости
 RUN go mod download
-
-# Копируем все файлы проекта
 COPY . .
+RUN CGO_ENABLED=1 go build -ldflags="-s -w" -o /out/sirius ./cmd
 
-# Сборка Go-приложения
-RUN go build -o /sirius_future ./cmd/main.go
-
-# Шаг 2: Минимизируем финальный образ
-FROM alpine:latest
-
-WORKDIR /root/
-
-# Копируем собранное Go-приложение из builder-образа
-COPY --from=builder /sirius_future .
-
-# Копируем файл базы данных и логов
-COPY ./cmd/database/test.db ./database/test.db
-COPY ./cmd/log/sirius_future.log ./log/sirius_future.log
-
-# Открываем порт приложения
+FROM alpine:3.20
+WORKDIR /app
+COPY --from=build /out/sirius .
+RUN mkdir -p database
 EXPOSE 8080
-
-# Запускаем приложение
-CMD ["./sirius_future"]
+CMD ["./sirius"]

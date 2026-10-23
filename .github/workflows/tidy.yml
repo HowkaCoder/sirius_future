@@ -1,0 +1,26 @@
+name: tidy
+
+on:
+  pull_request:
+
+permissions:
+  contents: write
+
+jobs:
+  tidy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.head_ref }}
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: go mod tidy
+      - run: |
+          if ! git diff --quiet go.mod go.sum; then
+            git config user.name github-actions
+            git config user.email github-actions@github.com
+            git commit -am "go mod tidy"
+            git push
+          fi
