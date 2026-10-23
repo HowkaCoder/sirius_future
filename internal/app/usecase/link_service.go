@@ -6,13 +6,16 @@ import (
 	"sirius_future/internal/app/entity"
 	"sirius_future/internal/app/repository"
 	"sirius_future/internal/app/service"
+	"strings"
 	"time"
+
+	"golang.org/x/crypto/bcrypt"
 )
 
 type FutureSiriusUsecase interface {
 	CreateLink(userID uint, limit uint) (string, error)
 	CheckTheLink(url string) (bool, error)
-	CreateUser(user *entity.User) error
+	Register(user *entity.User, password, referralURL string) error
 
 	GetReferrerByUrl(url string) (*entity.User, error)
 	GetAllLinks() ([]entity.Link, error)
@@ -82,17 +85,20 @@ func (fsu *futureSiriusUsecase) GetAllPayments() ([]entity.Payment, error) {
 
 }
 func (fsu *futureSiriusUsecase) CreatePayment(payment *entity.Payment) error {
+	if payment.UserID == 0 || payment.Amount <= 0 {
+		return ValidationError{"user_id and positive amount are required"}
+	}
+	if err := fsu.service.CheckUserByID(payment.UserID); err != nil {
+		return ValidationError{"user not found"}
+	}
+	if payment.Status == "" {
+		payment.Status = "pending"
+	}
+
 	if err := fsu.repo.CreatePayment(payment); err != nil {
 		return err
 	}
-
-	payments, _ := fsu.repo.GetAllPayments()
-
-	data, err := json.Marshal(payments)
-	if err == nil {
-		fsu.redis.Set("all_payments", data, 3*time.Hour)
-	}
-
+	fsu.dropPaymentsCache(payment.UserID)
 	return nil
 }
 
@@ -100,15 +106,13 @@ func (fsu *futureSiriusUsecase) UpdatePayment(id uint, payment *entity.Payment) 
 	if err := fsu.repo.UpdatePayment(id, payment); err != nil {
 		return err
 	}
-
-	payments, _ := fsu.repo.GetAllPayments()
-
-	data, err := json.Marshal(payments)
-	if err == nil {
-		fsu.redis.Set("all_payments", data, 3*time.Hour)
-	}
-
+	fsu.dropPaymentsCache(payment.UserID)
 	return nil
+}
+
+func (fsu *futureSiriusUsecase) dropPaymentsCache(userID uint) {
+	fsu.redis.Delete("all_payments")
+	fsu.redis.Delete(fmt.Sprintf("user_payments_%d", userID))
 }
 
 func (fsu *futureSiriusUsecase) GetAllLinks() ([]entity.Link, error) {
@@ -162,29 +166,25 @@ func (fsu *futureSiriusUsecase) GetReferrerByUrl(url string) (*entity.User, erro
 }
 
 func (fru *futureSiriusUsecase) CreateLink(userID uint, limit uint) (string, error) {
-
+	if limit == 0 {
+		return "", ValidationError{"link_limit must be greater than zero"}
+	}
 	if err := fru.service.CheckUserByID(userID); err != nil {
-		return "", err
+		return "", ValidationError{"user not found"}
 	}
 
 	url := fru.service.GenerateRefferalLink(userID)
-
-	Link := &entity.Link{
+	link := &entity.Link{
 		Url:        url,
 		ReferrerID: userID,
 		Limit:      limit,
+		Status:     true,
 	}
-	if err := fru.repo.CreateLink(Link); err != nil {
+	if err := fru.repo.CreateLink(link); err != nil {
 		return "", err
 	}
 
-	links, _ := fru.repo.GetAllLinks()
-
-	data, err := json.Marshal(links)
-	if err == nil {
-		fru.redis.Set("all_links", data, 3*time.Hour)
-	}
-
+	fru.redis.Delete("all_links")
 	return url, nil
 }
 
@@ -192,24 +192,39 @@ func (fru *futureSiriusUsecase) CheckTheLink(url string) (bool, error) {
 	return fru.repo.CheckTheLink(url)
 }
 
-func (fru *futureSiriusUsecase) CreateUser(user *entity.User) error {
-	validateErrors := fru.service.UserValidate(user)
-	if len(validateErrors) > 0 {
-		for _, value := range validateErrors {
-			return fmt.Errorf("User Validate Error :%s", value)
-		}
+func (fru *futureSiriusUsecase) Register(user *entity.User, password, referralURL string) error {
+	if len(password) < 8 {
+		return ValidationError{"password must be at least 8 characters"}
 	}
 
-	if err := fru.repo.CreateUser(user); err != nil {
+	hash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
+	if err != nil {
+		return err
+	}
+	user.Password = string(hash)
+	user.Role = "user"
+	user.ReferrerID = 0
+
+	if errs := fru.service.UserValidate(user); len(errs) > 0 {
+		return ValidationError{strings.Join(errs, "; ")}
+	}
+
+	if referralURL == "" {
+		err = fru.repo.CreateUser(user)
+	} else {
+		err = fru.repo.CreateUserWithReferral(user, referralURL)
+	}
+	if err != nil {
 		return err
 	}
 
-	users, _ := fru.repo.GetAllUsers()
-
-	data, err := json.Marshal(users)
-	if err == nil {
-		fru.redis.Set("all_users", data, 3*time.Hour)
-	}
-
+	fru.redis.Delete("all_users")
+	fru.redis.Delete("all_links")
 	return nil
 }
+
+type ValidationError struct {
+	Msg string
+}
+
+func (e ValidationError) Error() string { return e.Msg }

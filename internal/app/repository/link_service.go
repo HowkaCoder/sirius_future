@@ -8,10 +8,16 @@ import (
 	"gorm.io/gorm"
 )
 
+var (
+	ErrLinkNotFound  = errors.New("link not found")
+	ErrLinkExhausted = errors.New("link is disabled or its limit is reached")
+)
+
 type FutureSiriusRepository interface {
 	CreateLink(link *entity.Link) error
 	CreateUser(user *entity.User) error
 	CheckTheLink(url string) (bool, error)
+	CreateUserWithReferral(user *entity.User, url string) error
 
 	GetAllUsers() ([]entity.User, error)
 
@@ -72,7 +78,8 @@ func (fsr *futureSiriusRepository) UpdatePayment(id uint, payment *entity.Paymen
 		return err
 	}
 
-	// Обновляем значения только если они заданы
+	payment.UserID = ePayment.UserID
+
 	if payment.Amount != 0 {
 		ePayment.Amount = payment.Amount
 	}
@@ -116,19 +123,20 @@ func (fsr *futureSiriusRepository) GetAllUsers() ([]entity.User, error) {
 
 func (fsr *futureSiriusRepository) GetReferrerByUrl(url string) (*entity.User, error) {
 	var link entity.Link
-	if err := fsr.db.Where("url = ?", url).Find(&link).Error; err != nil {
+	if err := fsr.db.Where("url = ?", url).First(&link).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, ErrLinkNotFound
+		}
 		fsr.log.Error("Error fetching link by URL", err, "url", url)
 		return nil, err
 	}
 
-	var user *entity.User
+	var user entity.User
 	if err := fsr.db.First(&user, link.ReferrerID).Error; err != nil {
 		fsr.log.Error("Error fetching referrer by URL", err, "url", url)
 		return nil, err
 	}
-
-	fsr.log.Info("Successfully fetched referrer by URL", "url", url, "referrerID", user.ID)
-	return user, nil
+	return &user, nil
 }
 
 func (fsr *futureSiriusRepository) CreateLink(link *entity.Link) error {
@@ -153,33 +161,49 @@ func (fsr *futureSiriusRepository) CreateUser(user *entity.User) error {
 
 func (fsr *futureSiriusRepository) CheckTheLink(url string) (bool, error) {
 	var link entity.Link
-
-	result := fsr.db.Where("url = ?", url).Find(&link)
-	if result.Error != nil {
-		if result.Error == gorm.ErrRecordNotFound {
-			fsr.log.Info("Link not found", "url", url)
-			return false, nil
+	if err := fsr.db.Where("url = ?", url).First(&link).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return false, ErrLinkNotFound
 		}
-		fsr.log.Error("Error fetching link by URL", result.Error, "url", url)
-		return false, result.Error
-	}
-
-	if url != link.Url {
-		fsr.log.Error("URL mismatch", errors.New("URL mismatch"), "providedUrl", url, "foundUrl", link.Url)
-		return false, errors.New("Error")
-	}
-
-	if link.Limit <= link.Count {
-		fsr.log.Info("Link usage limit reached", "url", url, "limit", link.Limit, "count", link.Count)
-		return false, nil
-	}
-
-	link.Count += 1
-	if err := fsr.db.Save(&link).Error; err != nil {
-		fsr.log.Error("Error updating link count", err, "url", url)
+		fsr.log.Error("Error fetching link by URL", err, "url", url)
 		return false, err
 	}
+	return link.Status && link.Count < link.Limit, nil
+}
 
-	fsr.log.Info("Link used successfully", "url", url, "newCount", link.Count)
-	return true, nil
+func (fsr *futureSiriusRepository) CreateUserWithReferral(user *entity.User, url string) error {
+	return fsr.db.Transaction(func(tx *gorm.DB) error {
+		var link entity.Link
+		if err := tx.Where("url = ?", url).First(&link).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return ErrLinkNotFound
+			}
+			return err
+		}
+
+		ok, err := useLink(tx, url)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return ErrLinkExhausted
+		}
+
+		user.ReferrerID = link.ReferrerID
+		if err := tx.Create(user).Error; err != nil {
+			return err
+		}
+		fsr.log.Info("User registered by referral link", "userID", user.ID, "referrerID", link.ReferrerID)
+		return nil
+	})
+}
+
+func useLink(db *gorm.DB, url string) (bool, error) {
+	res := db.Model(&entity.Link{}).
+		Where("url = ? AND status = ? AND count < `limit`", url, true).
+		UpdateColumn("count", gorm.Expr("count + 1"))
+	if res.Error != nil {
+		return false, res.Error
+	}
+	return res.RowsAffected == 1, nil
 }
