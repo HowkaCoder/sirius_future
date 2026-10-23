@@ -1,25 +1,26 @@
 package main
 
 import (
+	"context"
 	"log"
-	"net/http"
+	"os"
+	"os/signal"
 	"sirius_future/internal"
 	"sirius_future/internal/app/handler"
 	"sirius_future/internal/app/repository"
 	"sirius_future/internal/app/service"
 	"sirius_future/internal/app/usecase"
+	"strconv"
+	"syscall"
 	"time"
 
+	"github.com/gofiber/fiber/v2"
+	"github.com/gofiber/fiber/v2/middleware/recover"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/valyala/fasthttp/fasthttpadaptor"
-
-	"github.com/gofiber/fiber/v2"
-
 	"gorm.io/gorm"
 )
-
-var DB *gorm.DB
 
 var (
 	httpRequestsTotal = prometheus.NewCounterVec(
@@ -40,83 +41,96 @@ var (
 	)
 )
 
-func prometeus_init() {
-	prometheus.MustRegister(httpRequestsTotal)
-	prometheus.MustRegister(httpRequestDuration)
+func init() {
+	prometheus.MustRegister(httpRequestsTotal, httpRequestDuration)
 }
 
-var jwtSecret = []byte("supersecretkey")
+type config struct {
+	Port       string
+	DBPath     string
+	RedisAddr  string
+	AdminToken string
+}
+
+func loadConfig() config {
+	cfg := config{
+		Port:       os.Getenv("PORT"),
+		DBPath:     os.Getenv("DB_PATH"),
+		RedisAddr:  os.Getenv("REDIS_ADDR"),
+		AdminToken: os.Getenv("ADMIN_TOKEN"),
+	}
+	if cfg.Port == "" {
+		cfg.Port = "8080"
+	}
+	if cfg.DBPath == "" {
+		cfg.DBPath = "database/sirius.db"
+	}
+	return cfg
+}
 
 func main() {
-	DB = internal.DatabaseInit()
-	logger := service.InitLogger()
-	redisService := service.NewRedisService("localhost:6379")
+	cfg := loadConfig()
+	if cfg.AdminToken == "" {
+		log.Println("ADMIN_TOKEN is not set, admin endpoints are disabled")
+	}
 
-	logService := service.NewLoggerService(logger)
+	db, err := internal.DatabaseInit(cfg.DBPath)
+	if err != nil {
+		log.Fatalf("database: %v", err)
+	}
 
-	FutureSiriusRepo := repository.NewFutureSiriusRepository(DB, logService)
-	FutureSiriusService := service.NewFutureSiriusService(DB)
-	FutureSiriusUsecase := usecase.NewFutureSiriusUsecase(FutureSiriusRepo, FutureSiriusService, *redisService)
-	FutureSiriusHandler := handler.NewLinkHandler(FutureSiriusUsecase)
+	app := newApp(db, cfg)
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	go func() {
+		<-ctx.Done()
+		app.ShutdownWithTimeout(10 * time.Second)
+	}()
+
+	if err := app.Listen(":" + cfg.Port); err != nil {
+		log.Fatal(err)
+	}
+}
+
+func newApp(db *gorm.DB, cfg config) *fiber.App {
+	logService := service.NewLoggerService(service.InitLogger())
+	repo := repository.NewFutureSiriusRepository(db, logService)
+	uc := usecase.NewFutureSiriusUsecase(repo, service.NewFutureSiriusService(db), *service.NewRedisService(cfg.RedisAddr))
+	h := handler.NewLinkHandler(uc)
 
 	app := fiber.New()
+	app.Use(recover.New())
+	app.Use(metrics)
 
-	// Middleware for Prometheus metrics
-	app.Use(func(c *fiber.Ctx) error {
-		start := time.Now()
-		err := c.Next()
-
-		status := c.Response().StatusCode()
-		httpRequestsTotal.WithLabelValues(c.Path(), c.Method(), http.StatusText(status)).Inc()
-		httpRequestDuration.WithLabelValues(c.Path(), c.Method(), http.StatusText(status)).Observe(time.Since(start).Seconds())
-
-		return err
-	})
-
-	// Public routes
-	app.Post("/api/create-link", FutureSiriusHandler.CreateLink)
-	app.Get("/api/check-link/:url", FutureSiriusHandler.CheckTheLink)
-	app.Post("/register", FutureSiriusHandler.CreateUserWithoutLink)
-	/*app.Post("/login", func(c *fiber.Ctx) error {
-		// Simplified authentication
-		type LoginRequest struct {
-			Username string `json:"username"`
-			Password string `json:"password"`
-		}
-		var req LoginRequest
-		if err := c.BodyParser(&req); err != nil {
-			return fiber.ErrBadRequest
-		}
-
-		// Здесь должна быть проверка пользователя в базе данных
-		// Для примера используем "admin" как username и password
-		if req.Username == "admin" && req.Password == "admin" {
-			token, err := generateJWT(req.Username)
-			if err != nil {
-				return fiber.ErrInternalServerError
-			}
-			return c.JSON(fiber.Map{"token": token})
-		}
-
-		return fiber.ErrUnauthorized
-	})
-	*/
-	// JWT-protected routes
-
-	app.Get("/api/users", FutureSiriusHandler.GetAllUsers)
-	app.Get("/api/links", FutureSiriusHandler.GetAllLinks)
-	app.Get("/api/get-referrer/:url", FutureSiriusHandler.GetReferrerByUrl)
-
-	app.Post("/api/payments", FutureSiriusHandler.CreatePayment)
-	app.Get("/api/payments", FutureSiriusHandler.GetAllPayments)
-	app.Get("/api/payments/user/:id", FutureSiriusHandler.GetPaymentsByUserID)
-	app.Patch("/api/payments/:id", FutureSiriusHandler.UpdatePayment)
-
-	// Prometheus metrics
 	app.Get("/metrics", func(c *fiber.Ctx) error {
 		fasthttpadaptor.NewFastHTTPHandler(promhttp.Handler())(c.Context())
 		return nil
 	})
 
-	log.Fatal(app.Listen(":8080"))
+	app.Post("/register", h.Register)
+	app.Get("/api/check-link/:url", h.CheckTheLink)
+	app.Get("/api/get-referrer/:url", h.GetReferrerByUrl)
+
+	admin := app.Group("/api", handler.AdminOnly(cfg.AdminToken))
+	admin.Post("/create-link", h.CreateLink)
+	admin.Get("/users", h.GetAllUsers)
+	admin.Get("/links", h.GetAllLinks)
+	admin.Post("/payments", h.CreatePayment)
+	admin.Get("/payments", h.GetAllPayments)
+	admin.Get("/payments/user/:id", h.GetPaymentsByUserID)
+	admin.Patch("/payments/:id", h.UpdatePayment)
+
+	return app
+}
+
+func metrics(c *fiber.Ctx) error {
+	start := time.Now()
+	err := c.Next()
+
+	status := strconv.Itoa(c.Response().StatusCode())
+	path := c.Route().Path
+	httpRequestsTotal.WithLabelValues(path, c.Method(), status).Inc()
+	httpRequestDuration.WithLabelValues(path, c.Method(), status).Observe(time.Since(start).Seconds())
+	return err
 }
